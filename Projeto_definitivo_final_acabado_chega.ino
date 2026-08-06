@@ -24,6 +24,17 @@ const unsigned long INTERVALO_DISPLAY_MS = 250;
 const unsigned long INTERVALO_SERIAL_MS = 1000;
 const unsigned long INTERVALO_PISCA_MS = 250;
 
+// A medida do sensor oscila alguns centimetros entre leituras consecutivas.
+// A mediana das ultimas AMOSTRAS descarta o pico isolado sem atrasar a
+// resposta como faria uma media. Uma leitura perdida no meio de leituras boas
+// tambem e ruido: so vira "sem eco" quando faltam validas demais na janela.
+const unsigned char AMOSTRAS = 5;
+const unsigned char MINIMO_VALIDAS = 3;
+
+// Folga exigida para trocar de faixa. Sem ela, uma distancia parada em cima
+// do limite alternava as cores dos LEDs sozinha.
+const float MARGEM_CM = 2.0;
+
 const unsigned char COLUNAS_LCD = 16;
 
 LiquidCrystal_I2C lcd(0x3F, COLUNAS_LCD, 2);
@@ -44,6 +55,10 @@ enum Faixa {
   FAIXA_SEM_ECO
 };
 
+Leitura janela[AMOSTRAS];
+unsigned char proximaAmostra = 0;
+
+Leitura leituraBruta = { false, NAN };
 Leitura leituraAtual = { false, NAN };
 Faixa faixaAtual = FAIXA_SEM_ECO;
 float limite1 = 0.0;
@@ -54,7 +69,9 @@ unsigned long ultimoDisplay = 0;
 unsigned long ultimaSerial = 0;
 
 Leitura medirDistancia();
-Faixa classificar(Leitura leitura, float limite1, float limite2);
+Leitura filtrar();
+float mediana(float *valores, unsigned char n);
+Faixa classificar(Leitura leitura, float limite1, float limite2, Faixa atual);
 void atualizarLimites();
 void escreverLinha(unsigned char linha, const char *texto);
 const char *nomeDaFaixa(Faixa faixa);
@@ -67,6 +84,11 @@ void setup() {
   pinMode(ledVerde, OUTPUT);
   Serial.begin(9600);
   Serial.print("Hello World!");
+
+  for (unsigned char i = 0; i < AMOSTRAS; i++) {
+    janela[i] = Leitura{ false, NAN };
+  }
+
   // O display se inicializa uma vez. Fazer isso a cada volta do loop era o
   // que apagava a tela inteira vinte vezes por segundo.
   lcd.init();
@@ -81,8 +103,13 @@ void loop() {
   if (agora - ultimaMedida >= INTERVALO_MEDIDA_MS) {
     ultimaMedida = agora;
     atualizarLimites();
-    leituraAtual = medirDistancia();
-    faixaAtual = classificar(leituraAtual, limite1, limite2);
+
+    leituraBruta = medirDistancia();
+    janela[proximaAmostra] = leituraBruta;
+    proximaAmostra = (proximaAmostra + 1) % AMOSTRAS;
+
+    leituraAtual = filtrar();
+    faixaAtual = classificar(leituraAtual, limite1, limite2, faixaAtual);
   }
 
   // Acender. Roda toda volta porque e barato e porque o pisca precisa da hora.
@@ -117,13 +144,20 @@ void loop() {
     Serial.print(limite1);
     Serial.print(" <= amarelo < ");
     Serial.print(limite2);
-    Serial.print(" <= vermelho  |  leitura: ");
+    Serial.print(" <= vermelho  |  bruta: ");
+    if (leituraBruta.valida) {
+      Serial.print(leituraBruta.cm);
+    } else {
+      Serial.print("sem eco");
+    }
+    Serial.print("  |  filtrada: ");
     if (leituraAtual.valida) {
       Serial.print(leituraAtual.cm);
-      Serial.println(" cm");
     } else {
-      Serial.println("sem eco");
+      Serial.print("sem eco");
     }
+    Serial.print("  |  faixa: ");
+    Serial.println(nomeDaFaixa(faixaAtual));
   }
 }
 
@@ -143,20 +177,59 @@ Leitura medirDistancia() {
   return Leitura{ true, (float)((duracao * 0.0343) / 2.0) };
 }
 
+Leitura filtrar() {
+  float validas[AMOSTRAS];
+  unsigned char n = 0;
+  for (unsigned char i = 0; i < AMOSTRAS; i++) {
+    if (janela[i].valida) {
+      validas[n] = janela[i].cm;
+      n++;
+    }
+  }
+  if (n < MINIMO_VALIDAS) {
+    return Leitura{ false, NAN };
+  }
+  return Leitura{ true, mediana(validas, n) };
+}
+
+float mediana(float *valores, unsigned char n) {
+  for (unsigned char i = 1; i < n; i++) {
+    float chave = valores[i];
+    signed char j = i - 1;
+    while (j >= 0 && valores[j] > chave) {
+      valores[j + 1] = valores[j];
+      j--;
+    }
+    valores[j + 1] = chave;
+  }
+  return valores[n / 2];
+}
+
 void atualizarLimites() {
   float volt = analogRead(potencPin) * 5.0 / 1023.0;
   limite1 = 5 * volt;
   limite2 = 10 * volt;
 }
 
-Faixa classificar(Leitura leitura, float limite1, float limite2) {
+Faixa classificar(Leitura leitura, float limite1, float limite2, Faixa atual) {
   if (!leitura.valida) {
     return FAIXA_SEM_ECO;
   }
-  if (leitura.cm < limite1) {
+  // Voltando de "sem eco" nao existe faixa anterior para segurar, entao os
+  // limites valem crus.
+  if (atual == FAIXA_SEM_ECO) {
+    if (leitura.cm < limite1) return FAIXA_VERDE;
+    if (leitura.cm < limite2) return FAIXA_AMARELO;
+    return FAIXA_VERMELHO;
+  }
+  // Nas demais, cada limite se desloca para o lado que dificulta a saida da
+  // faixa em que o sistema ja esta.
+  float corte1 = (atual == FAIXA_VERDE) ? limite1 + MARGEM_CM : limite1 - MARGEM_CM;
+  float corte2 = (atual == FAIXA_VERMELHO) ? limite2 - MARGEM_CM : limite2 + MARGEM_CM;
+  if (leitura.cm < corte1) {
     return FAIXA_VERDE;
   }
-  if (leitura.cm < limite2) {
+  if (leitura.cm < corte2) {
     return FAIXA_AMARELO;
   }
   return FAIXA_VERMELHO;
