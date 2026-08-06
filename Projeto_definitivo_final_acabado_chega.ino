@@ -22,7 +22,7 @@ void setup() {
   pinMode(ledVerde, OUTPUT);
   Serial.begin(9600);
   Serial.print("Hello World!");
-  lcd.begin();
+  lcd.init();
   lcd.backlight();
 
 }
@@ -33,8 +33,8 @@ void loop() {
   //Serial.print(distancia);
   //Serial.println(" cm");
 
-  
-  lcd.begin();
+
+  lcd.init();
   lcd.backlight();
   lcd.print("Distancia: ");
   lcd.print(distancia);
