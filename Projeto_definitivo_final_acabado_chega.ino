@@ -1,6 +1,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <Wire.h>
 #include <math.h>
+#include <stdlib.h>
 
 
 const unsigned char trigPin = 9;
@@ -15,7 +16,17 @@ const unsigned int ledVerde = 11;
 const float ALCANCE_MAXIMO_CM = 400.0;
 const unsigned long TIMEOUT_ECO_US = (unsigned long)(2.0 * ALCANCE_MAXIMO_CM / 0.0343);
 
-LiquidCrystal_I2C lcd(0x3F, 16, 2);
+// Cada tarefa tem a sua propria frequencia. O sensor mede rapido porque o
+// objeto se move, o display atualiza devagar porque olho humano nao le a 20 Hz,
+// e a serial fala uma vez por segundo para nao virar cachoeira de texto.
+const unsigned long INTERVALO_MEDIDA_MS = 60;
+const unsigned long INTERVALO_DISPLAY_MS = 250;
+const unsigned long INTERVALO_SERIAL_MS = 1000;
+const unsigned long INTERVALO_PISCA_MS = 250;
+
+const unsigned char COLUNAS_LCD = 16;
+
+LiquidCrystal_I2C lcd(0x3F, COLUNAS_LCD, 2);
 
 // Ou a leitura tem distancia, ou ela nao tem. Nenhum valor de "cm" significa
 // falha: quem usa a leitura precisa olhar para "valida" primeiro. Quando a
@@ -25,10 +36,30 @@ struct Leitura {
   float cm;
 };
 
+// Sem eco e uma faixa como as outras, nao a ausencia de faixa.
+enum Faixa {
+  FAIXA_VERDE,
+  FAIXA_AMARELO,
+  FAIXA_VERMELHO,
+  FAIXA_SEM_ECO
+};
+
+Leitura leituraAtual = { false, NAN };
+Faixa faixaAtual = FAIXA_SEM_ECO;
+float limite1 = 0.0;
+float limite2 = 0.0;
+
+unsigned long ultimaMedida = 0;
+unsigned long ultimoDisplay = 0;
+unsigned long ultimaSerial = 0;
+
 Leitura medirDistancia();
+Faixa classificar(Leitura leitura, float limite1, float limite2);
+void atualizarLimites();
+void escreverLinha(unsigned char linha, const char *texto);
+const char *nomeDaFaixa(Faixa faixa);
 
 void setup() {
-  // put your setup code here, to run once:
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
   pinMode(ledVermelho, OUTPUT);
@@ -36,64 +67,67 @@ void setup() {
   pinMode(ledVerde, OUTPUT);
   Serial.begin(9600);
   Serial.print("Hello World!");
+  // O display se inicializa uma vez. Fazer isso a cada volta do loop era o
+  // que apagava a tela inteira vinte vezes por segundo.
   lcd.init();
   lcd.backlight();
-
 }
+
 void loop() {
-  // put your main code here, to run repeatedly:
-  Leitura leitura = medirDistancia();
+  unsigned long agora = millis();
 
-  lcd.init();
-  lcd.backlight();
-  if (leitura.valida) {
-    lcd.print("Distancia: ");
-    lcd.print(leitura.cm);
-  } else {
-    lcd.print("Sem eco");
+  // Medir. A unica espera que sobrou e a do proprio pulseIn(), limitada pelo
+  // timeout: no pior caso, sem eco nenhum, sao 23 ms.
+  if (agora - ultimaMedida >= INTERVALO_MEDIDA_MS) {
+    ultimaMedida = agora;
+    atualizarLimites();
+    leituraAtual = medirDistancia();
+    faixaAtual = classificar(leituraAtual, limite1, limite2);
   }
 
-  float value = analogRead(potencPin);
-  float volt = value * 5.0 / 1023.0;
+  // Acender. Roda toda volta porque e barato e porque o pisca precisa da hora.
+  bool vermelhoAceso = (faixaAtual == FAIXA_VERMELHO);
+  if (faixaAtual == FAIXA_SEM_ECO) {
+    vermelhoAceso = ((agora / INTERVALO_PISCA_MS) % 2) == 0;
+  }
+  digitalWrite(ledVerde, faixaAtual == FAIXA_VERDE ? HIGH : LOW);
+  digitalWrite(ledAmarelo, faixaAtual == FAIXA_AMARELO ? HIGH : LOW);
+  digitalWrite(ledVermelho, vermelhoAceso ? HIGH : LOW);
 
-  float incremento1 = 5 *volt;
-  float incremento2 = 10 *volt;
-
-  Serial.print("Verde < ");
-  Serial.print(incremento1);
-  Serial.print("|  ");
-  Serial.print(incremento1);
-  Serial.print(" <= amarelo < ");
-  Serial.print(incremento2);
-  Serial.print("|  ");
-  Serial.print(incremento2);
-  Serial.println(" >= vermelho");
-
-  if (!leitura.valida) {
-    // Sem eco nao e distancia zero. Nenhum LED acende dizendo que esta perto.
-    Serial.println("Sem eco: o sensor nao esta enxergando nada.");
-    digitalWrite(ledVerde, LOW);
-    digitalWrite(ledAmarelo, LOW);
-    digitalWrite(ledVermelho, LOW);
-  }else if(leitura.cm < incremento1) {
-    digitalWrite(ledVerde, HIGH);
-    digitalWrite(ledAmarelo, LOW);
-    digitalWrite(ledVermelho, LOW);
-  }else if ((incremento1 <= leitura.cm) && (leitura.cm < incremento2)) {
-    digitalWrite(ledVerde, LOW);
-    digitalWrite(ledAmarelo, HIGH);
-    digitalWrite(ledVermelho, LOW);
-  }else if (incremento2 <= leitura.cm) {
-    digitalWrite(ledVerde, LOW);
-    digitalWrite(ledAmarelo, LOW);
-    digitalWrite(ledVermelho, HIGH);
+  // Escrever no display, sem limpar a tela: cada linha e reescrita completa,
+  // com espacos ate o fim, entao nao sobra resto da mensagem anterior.
+  if (agora - ultimoDisplay >= INTERVALO_DISPLAY_MS) {
+    ultimoDisplay = agora;
+    char linha[COLUNAS_LCD + 1];
+    if (leituraAtual.valida) {
+      char numero[10];
+      dtostrf(leituraAtual.cm, 0, 1, numero);
+      snprintf(linha, sizeof(linha), "Dist: %s cm", numero);
+    } else {
+      snprintf(linha, sizeof(linha), "Sem eco");
+    }
+    escreverLinha(0, linha);
+    snprintf(linha, sizeof(linha), "Faixa: %s", nomeDaFaixa(faixaAtual));
+    escreverLinha(1, linha);
   }
 
-
-  delay(50);
+  if (agora - ultimaSerial >= INTERVALO_SERIAL_MS) {
+    ultimaSerial = agora;
+    Serial.print("Verde < ");
+    Serial.print(limite1);
+    Serial.print(" <= amarelo < ");
+    Serial.print(limite2);
+    Serial.print(" <= vermelho  |  leitura: ");
+    if (leituraAtual.valida) {
+      Serial.print(leituraAtual.cm);
+      Serial.println(" cm");
+    } else {
+      Serial.println("sem eco");
+    }
+  }
 }
 
-Leitura medirDistancia(){
+Leitura medirDistancia() {
   digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
   digitalWrite(trigPin, HIGH);
@@ -107,4 +141,39 @@ Leitura medirDistancia(){
     return Leitura{ false, NAN };
   }
   return Leitura{ true, (float)((duracao * 0.0343) / 2.0) };
+}
+
+void atualizarLimites() {
+  float volt = analogRead(potencPin) * 5.0 / 1023.0;
+  limite1 = 5 * volt;
+  limite2 = 10 * volt;
+}
+
+Faixa classificar(Leitura leitura, float limite1, float limite2) {
+  if (!leitura.valida) {
+    return FAIXA_SEM_ECO;
+  }
+  if (leitura.cm < limite1) {
+    return FAIXA_VERDE;
+  }
+  if (leitura.cm < limite2) {
+    return FAIXA_AMARELO;
+  }
+  return FAIXA_VERMELHO;
+}
+
+const char *nomeDaFaixa(Faixa faixa) {
+  switch (faixa) {
+    case FAIXA_VERDE: return "verde";
+    case FAIXA_AMARELO: return "amarelo";
+    case FAIXA_VERMELHO: return "vermelho";
+    default: return "sem eco";
+  }
+}
+
+void escreverLinha(unsigned char linha, const char *texto) {
+  char preenchida[COLUNAS_LCD + 1];
+  snprintf(preenchida, sizeof(preenchida), "%-16s", texto);
+  lcd.setCursor(0, linha);
+  lcd.print(preenchida);
 }
